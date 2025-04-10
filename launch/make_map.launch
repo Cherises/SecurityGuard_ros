@@ -1,0 +1,5 @@
+<launch>
+	 <include file="$(find handsfree_2dslam)/launch/slam.launch">
+		<arg name="sim" value="false"/>  
+	 </include>
+</launch>

@@ -1,0 +1,124 @@
+#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
+
+import rospy
+from darknet_ros_msgs.msg import BoundingBoxes, BoundingBox
+import Tkinter as tk
+import ttk
+from PIL import Image, ImageTk
+import cv2
+from cv_bridge import CvBridge
+from sensor_msgs.msg import Image as ROSImage
+import os
+from datetime import datetime
+
+class DetectionGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("\xe7\x89\xa9\xe4\xbd\x93\xe6\xa3\x80\xe6\xb5\x8b\xe4\xbf\xa1\xe6\x81\xaf\xe5\xb1\x95\xe7\xa4\xba")
+        self.root.geometry("1200x800")
+        
+        rospy.init_node('detection_gui_node', anonymous=True)
+        
+        self.bridge = CvBridge()
+        
+        self.last_person_detection = None
+        self.captured_image = None
+        self.captured_image_tk = None
+        
+        self.create_widgets()
+        
+        self.sub_boxes = rospy.Subscriber('/darknet_ros/bounding_boxes', BoundingBoxes, self.bounding_box_callback)
+        self.sub_image = rospy.Subscriber('/camera/rgb/image_raw', ROSImage, self.image_callback)
+        
+        self.current_frame = None
+        
+        self.update_gui()
+    
+    def create_widgets(self):
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        left_frame = ttk.Frame(main_frame)
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        ttk.Label(left_frame, text="\xe6\xa3\x80\xe6\xb5\x8b\xe4\xbf\xa1\xe6\x81\xaf", font=('Arial', 14, 'bold')).pack(pady=5)
+        
+        self.tree = ttk.Treeview(left_frame, columns=('Class', 'Probability', 'Xmin', 'Ymin', 'Xmax', 'Ymax', 'ID'), show='headings')
+        for col in ('Class', 'Probability', 'Xmin', 'Ymin', 'Xmax', 'Ymax', 'ID'):
+            self.tree.heading(col, text=col)
+        self.tree.pack(fill=tk.BOTH, expand=True)
+        
+        right_frame = ttk.Frame(main_frame)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False)
+        
+        ttk.Label(right_frame, text="\xe5\xae\x9e\xe6\x97\xb6\xe5\x9b\xbe\xe5\x83\x8f", font=('Arial', 14, 'bold')).pack(pady=5)
+        self.image_label = ttk.Label(right_frame)
+        self.image_label.pack()
+        
+        ttk.Label(right_frame, text="\xe6\x8d\x95\xe8\x8e\xb7\xe7\x9a\x84\xe5\x9b\xbe\xe5\x83\x8f", font=('Arial', 14, 'bold')).pack(pady=5)
+        self.captured_label = ttk.Label(right_frame)
+        self.captured_label.pack()
+        
+        self.status_var = tk.StringVar()
+        self.status_var.set("\xe7\xad\x89\xe5\xbe\x85\xe6\xa3\x80\xe6\xb5\x8b\xe6\x95\xb0\xe6\x8d\xae...")
+        ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN).pack(fill=tk.X, side=tk.BOTTOM)
+    
+    def bounding_box_callback(self, msg):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        person_detected = False
+        for box in msg.bounding_boxes:
+            self.tree.insert('', 'end', values=(
+                box.Class, "{:.2f}".format(box.probability), box.xmin, box.ymin, box.xmax, box.ymax, box.id
+            ))
+            
+            if box.Class.lower() == "person" and box.probability > 0.8:
+                person_detected = True
+                self.last_person_detection = box
+        
+        if person_detected and self.current_frame is not None:
+            self.capture_image()
+    
+    def image_callback(self, msg):
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            self.current_frame = cv_image
+            self.update_realtime_image(cv_image)
+        except Exception as e:
+            print("\xe5\x9b\xbe\xe5\x83\x8f\xe8\xbd\xac\xe6\x8d\xa2\xe9\x94\x99\xe8\xaf\xaf:", e)
+    
+    def capture_image(self):
+        if self.current_frame is not None:
+            filename = "person_detection_{}.jpg".format(datetime.now().strftime("%Y%m%d_%H%M%S"))
+            cv2.imwrite(filename, self.current_frame)
+            print("\xe4\xbf\x9d\xe5\xad\x98\xe5\x9b\xbe\xe5\x83\x8f:", filename)
+            self.status_var.set("\xe5\xb7\xb2\xe4\xbf\x9d\xe5\xad\x98\xe5\x9b\xbe\xe5\x83\x8f: " + filename)
+    
+    def update_realtime_image(self, cv_image):
+        height, width = cv_image.shape[:2]
+        resized = cv2.resize(cv_image, (400, int(400 * height / width)))
+        img = Image.fromarray(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB))
+        imgtk = ImageTk.PhotoImage(image=img)
+        self.image_label.configure(image=imgtk)
+        self.image_label.image = imgtk
+    
+    def update_gui(self):
+        self.root.update()
+        self.root.after(100, self.update_gui)
+    
+    def on_closing(self):
+        self.sub_boxes.unregister()
+        self.sub_image.unregister()
+        self.root.destroy()
+
+if __name__ == '__main__':
+    try:
+        root = tk.Tk()
+        app = DetectionGUI(root)
+        root.protocol("WM_DELETE_WINDOW", app.on_closing)
+        root.mainloop()
+    except rospy.ROSInterruptException:
+        pass
+

@@ -1,0 +1,12 @@
+<launch>
+	 <include file="$(find handsfree_2dnav)/launch/navigation.launch">
+ 		<arg name="sim" value="false"/>
+		<arg name="map_name" value="map03"/>   
+	 </include>
+	
+	 <include file="$(find handsfree_camera)/launch/rgb-d/astra/astra_dabai.launch">
+        </include>
+
+	 <include file="$(find darknet_ros)/launch/yolo_v3.launch">
+	</include>
+</launch>

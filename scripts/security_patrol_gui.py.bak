@@ -1,0 +1,224 @@
+#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
+
+import rospy
+import os
+import subprocess
+import threading
+import cv2
+from datetime import datetime
+from Tkinter import *
+from ttk import Treeview, Combobox
+from geometry_msgs.msg import PointStamped, PoseStamped, Twist
+from darknet_ros_msgs.msg import BoundingBoxes
+from tf import TransformListener
+
+class SecurityPatrolGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("智能巡逻系统")
+        self.points = []
+        self.tf_listener = TransformListener()
+        self.current_bboxes = []
+        self.running = False
+
+        self.setup_gui()
+        rospy.init_node("security_patrol_gui", anonymous=True)
+        rospy.Subscriber("/clicked_point", PointStamped, self.point_callback)
+        rospy.Subscriber("/darknet_ros/bounding_boxes", BoundingBoxes, self.bbox_callback)
+        self.goal_pub = rospy.Publisher("/move_base_simple/goal", PoseStamped, queue_size=10)
+        self.stop_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+
+    def setup_gui(self):
+        self.left_frame = Frame(self.root)
+        self.left_frame.pack(side=LEFT, fill=Y)
+
+        self.tree = Treeview(self.left_frame, columns=('X', 'Y', 'Class'), show='headings')
+        self.tree.heading('X', text='X 坐标')
+        self.tree.heading('Y', text='Y 坐标')
+        self.tree.heading('Class', text='目标类别')
+        self.tree.pack(fill=Y)
+
+        self.right_frame = Frame(self.root)
+        self.right_frame.pack(side=RIGHT, fill=BOTH, expand=True)
+
+        self.start_btn = Button(self.right_frame, text="开始巡逻", command=self.start_patrol_thread)
+        self.start_btn.pack(pady=5)
+
+        self.stop_btn = Button(self.right_frame, text="急停", command=self.stop_robot)
+        self.stop_btn.pack(pady=5)
+
+        self.open_folder_btn = Button(self.right_frame, text="打开照片文件夹", command=self.open_folder)
+        self.open_folder_btn.pack(pady=5)
+
+        self.log_text = Text(self.right_frame, height=20)
+        self.log_text.pack(fill=BOTH, expand=True)
+
+    def point_callback(self, msg):
+        new_window = Toplevel(self.root)
+        new_window.title("选择物体类别")
+
+        Label(new_window, text="为坐标({:.2f}, {:.2f})选择类别：".format(msg.point.x, msg.point.y)).pack()
+        class_var = StringVar(new_window)
+        class_combobox = Combobox(new_window, textvariable=class_var)
+        class_combobox['values'] = ("chair", "bottle", "tvmonitor", "cup", "person")
+        class_combobox.current(0)
+        class_combobox.pack()
+
+        def confirm():
+            selected_class = class_combobox.get()
+            self.points.append((msg.point.x, msg.point.y, selected_class))
+            self.tree.insert('', 'end', values=(round(msg.point.x, 2), round(msg.point.y, 2), selected_class))
+            self.log("添加坐标点：({}, {})，类别：{}".format(msg.point.x, msg.point.y, selected_class))
+            new_window.destroy()
+
+        Button(new_window, text="确认", command=confirm).pack()
+
+    def bbox_callback(self, msg):
+        self.current_bboxes = msg.bounding_boxes
+
+    def start_patrol_thread(self):
+        if not self.running:
+            threading.Thread(target=self.start_patrol).start()
+
+    def start_patrol(self):
+        self.running = True
+        for x, y, target_class in self.points:
+            if not self.running:
+                break
+            self.log("导航到目标点 ({:.2f}, {:.2f})...".format(x, y))
+            self.speak("start")
+            self.send_goal(x, y)
+
+            success = self.wait_until_arrival(x, y)
+            if not success:
+                self.log("未能到达目标点")
+                continue
+
+            rospy.sleep(1)
+            found = self.check_object(target_class)
+            if found:
+                self.log("检测到目标物体：{}".format(target_class))
+                #self.speak("检测到{}".format(target_class))
+                self.speak("success")
+            else:
+                self.log("未检测到目标物体：{}".format(target_class))
+                #self.speak("未检测到{}".format(target_class))
+                self.speak("failed")
+
+        self.running = False
+        self.log("巡逻完成。")
+        self.speak("end")
+
+    def wait_until_arrival(self, x, y, threshold=1.0, timeout=60):
+        start_time = rospy.Time.now().to_sec()
+        while rospy.Time.now().to_sec() - start_time < timeout:
+            try:
+                now = rospy.Time(0)
+                self.tf_listener.waitForTransform("map", "base_link", now, rospy.Duration(1.0))
+                (trans, _) = self.tf_listener.lookupTransform("map", "base_link", now)
+                dist = ((x - trans[0]) ** 2 + (y - trans[1]) ** 2) ** 0.5
+                if dist <= threshold:
+                    return True
+
+                for box in self.current_bboxes:
+                    if box.Class == "person" and box.probability > 0.9:
+                        self.log("检测到行人！保存照片中...")
+                        self.speak("person")
+                        self.save_person_image()
+                rospy.sleep(0.5)
+            except Exception as e:
+                self.log("TF 获取失败：{}".format(e))
+                rospy.sleep(0.5)
+        return False
+
+    def send_goal(self, x, y):
+        goal = PoseStamped()
+        goal.header.frame_id = "map"
+        goal.header.stamp = rospy.Time.now()
+        goal.pose.position.x = x
+        goal.pose.position.y = y
+        goal.pose.orientation.w = 1.0
+        self.goal_pub.publish(goal)
+
+    def stop_robot(self):
+        self.running = False
+        twist = Twist()
+        self.stop_pub.publish(twist)
+        self.log("机器人急停。")
+        #self.speak("机器人已停止")
+
+    def check_object(self, target_class):
+        for box in self.current_bboxes:
+            if box.Class == target_class and box.probability > 0.8:
+                return True
+        return False
+
+    def save_person_image(self):
+        # cap = cv2.VideoCapture(0)
+        # ret, frame = cap.read()
+        # if ret:
+        #     folder = os.path.join(os.getcwd(), "person")
+        #     if not os.path.exists(folder):
+        #         os.makedirs(folder)
+        #     filename = datetime.now().strftime("%Y%m%d_%H%M%S.jpg")
+        #     cv2.imwrite(os.path.join(folder, filename), frame)
+        # cap.release()
+        save_dir = "/home/handsfree/catkin_ws/src/security_guard/src/person/"
+        
+        # 确保目录存在
+        if not os.path.exists(save_dir):
+            try:
+                os.makedirs(save_dir)
+            except OSError as e:
+                rospy.logerr("无法创建目录 %s: %s" % (save_dir, str(e)))
+                return False
+
+        # 捕获图像
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            rospy.logerr("无法打开摄像头")
+            return False
+
+        ret, frame = cap.read()
+        cap.release()  # 立即释放摄像头
+
+        if not ret:
+            rospy.logerr("无法读取摄像头画面")
+            return False
+
+        # 生成文件名（Python 2.7旧式字符串格式化）
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = "person_%s.jpg" % timestamp
+        filepath = os.path.join(save_dir, filename)
+
+        # 保存图像
+        try:
+            cv2.imwrite(filepath, frame)
+            rospy.loginfo("人员图像已保存至: %s" % filepath)
+            return True
+        except Exception as e:
+            rospy.logerr("保存图像失败: %s" % str(e))
+            return False
+
+    def open_folder(self):
+        folder = os.path.join(os.getcwd(), "person")
+        if not os.path.exists(folder):
+            os.makedirs(folder)
+        subprocess.Popen(['xdg-open', folder])
+
+    def speak(self, message):
+        #message: start  end  success  failed  person
+        voice_dir = "/home/handsfree/catkin_ws/src/security_guard/src/voice/"
+        mp3_path = os.path.join(voice_dir, message + ".mp3")
+        os.system("play " + mp3_path)
+
+    def log(self, message):
+        self.log_text.insert(END, message + "\n")
+        self.log_text.see(END)
+
+if __name__ == "__main__":
+    root = Tk()
+    app = SecurityPatrolGUI(root)
+    root.mainloop()
+
